@@ -1,0 +1,59 @@
+name: Validate standalone action
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned validators
+        run: |
+          python3 -m venv "$RUNNER_TEMP/validators"
+          "$RUNNER_TEMP/validators/bin/python" -m pip install --disable-pip-version-check 'zizmor==1.30.1'
+          curl --fail --silent --show-error --location 'https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz' -o "$RUNNER_TEMP/actionlint.tar.gz"
+          printf '%s  %s\n' '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8' "$RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/validators/bin" actionlint
+          printf '%s\n' "$RUNNER_TEMP/validators/bin" >> "$GITHUB_PATH"
+      - name: Run unit and workflow checks
+        run: bash scripts/check.sh
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        fixture: [general, laravel, kirby, php, node]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Scan own fixture without ingest credentials
+        id: scan
+        uses: ./ # zizmor: ignore[self-repository] Actionlint 1.7.12 cannot parse GitHub's newer $/ syntax yet.
+        with:
+          working-directory: tests/fixtures/${{ matrix.fixture }}
+          semgrep-config: .semgrep.yml
+          gitleaks-config: .gitleaks.toml
+      - name: Verify reports and scan-only outcome
+        env:
+          REPORTS_PATH: ${{ steps.scan.outputs.reports-path }}
+          UPLOAD_STATUS: ${{ steps.scan.outputs.upload-status }}
+        run: |
+          test "$UPLOAD_STATUS" = skipped
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          reports = Path(os.environ['REPORTS_PATH'])
+          summary = json.loads((reports / 'summary.json').read_text())
+          for name in ('gitleaks', 'semgrep', 'trivy'):
+              assert summary['tools'][name]['status'] == 'completed', name
+              assert len(summary['tools'][name]['scope_hash']) == 64, name
+              assert (reports / f'{name}.json').is_file(), name
+          PY

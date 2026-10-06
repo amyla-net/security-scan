@@ -1,0 +1,6 @@
+{
+  "name": "amyla/fixture-laravel",
+  "require": {
+    "laravel/framework": "*"
+  }
+}

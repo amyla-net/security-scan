@@ -1,0 +1,6 @@
+{
+  "name": "amyla/fixture-php",
+  "require": {
+    "psr/log": "*"
+  }
+}

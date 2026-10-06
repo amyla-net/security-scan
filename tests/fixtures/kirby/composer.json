@@ -1,0 +1,6 @@
+{
+  "name": "amyla/fixture-kirby",
+  "require": {
+    "getkirby/cms": "*"
+  }
+}

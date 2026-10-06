@@ -1,0 +1,6 @@
+rules:
+  - id: amyla-php-eval
+    message: Avoid evaluating dynamically constructed PHP code.
+    languages: [php]
+    severity: ERROR
+    pattern: eval(...)

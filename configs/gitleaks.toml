@@ -1,0 +1,3 @@
+title = "Amyla action smoke-test configuration"
+[extend]
+useDefault = true
