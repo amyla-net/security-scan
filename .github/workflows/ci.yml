@@ -16,7 +16,7 @@ jobs:
       - name: Install pinned validators
         run: |
           python3 -m venv "$RUNNER_TEMP/validators"
-          "$RUNNER_TEMP/validators/bin/python" -m pip install --disable-pip-version-check 'zizmor==1.30.1'
+          "$RUNNER_TEMP/validators/bin/python" -m pip install --disable-pip-version-check 'zizmor==1.30.1' 'PyYAML==6.0.3'
           curl --fail --silent --show-error --location 'https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz' -o "$RUNNER_TEMP/actionlint.tar.gz"
           printf '%s  %s\n' '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8' "$RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/validators/bin" actionlint

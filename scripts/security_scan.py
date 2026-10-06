@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import html
+import http.client
 import json
 import os
 import re
@@ -164,6 +165,23 @@ def assert_full_git_history(root: Path, environment: dict[str, str]) -> None:
         raise ValueError("Gitleaks git mode requires a full checkout with fetch-depth: 0.")
 
 
+def neon_without_comment(line: str) -> str:
+    quote = None
+    escaped = False
+    for index, character in enumerate(line):
+        if escaped:
+            escaped = False
+        elif quote and character == "\\":
+            escaped = True
+        elif character == quote:
+            quote = None
+        elif quote is None and character in {"'", '"'}:
+            quote = character
+        elif quote is None and character == "#":
+            return line[:index]
+    return line
+
+
 def phpstan_config_files(root: Path, config: Path) -> list[str]:
     files = []
     queue = [config]
@@ -179,6 +197,7 @@ def phpstan_config_files(root: Path, config: Path) -> list[str]:
         inside = False
         includes_indent = 0
         for line in lines:
+            line = neon_without_comment(line)
             if re.match(r"^\s*includes:", line):
                 inside = True
                 includes_indent = len(line) - len(line.lstrip())
@@ -189,9 +208,9 @@ def phpstan_config_files(root: Path, config: Path) -> list[str]:
                     included.extend(split_items(inline[1:-1]))
                 continue
             indent = len(line) - len(line.lstrip())
-            if inside and line.strip() and indent <= includes_indent and not line.lstrip().startswith("#"):
+            if inside and line.strip() and indent <= includes_indent:
                 inside = False
-            if inside and line.strip() and not line.lstrip().startswith("#"):
+            if inside and line.strip():
                 if not line.lstrip().startswith("- "):
                     raise ValueError("PHPStan includes must use a static NEON list.")
                 included.append(line.lstrip()[2:].strip())
@@ -204,6 +223,70 @@ def phpstan_config_files(root: Path, config: Path) -> list[str]:
                 raise ValueError("PHPStan included configs must stay inside the repository directory.")
             queue.append(resolved)
     return files
+
+
+def trivy_config_files(root: Path, tools: Path, environment: dict[str, str]) -> list[str]:
+    files = []
+    ignorefile = ".trivyignore"
+    explicit_ignore = False
+    if (root / "trivy.yaml").exists() or (root / "trivy.yaml").is_symlink():
+        config = safe_path(root, "trivy.yaml")
+        files.append(str(config))
+        python = install("pyyaml", tools, environment)
+        # Use a safe YAML loader in an isolated interpreter so repository modules
+        # cannot shadow the parser. Emit only the setting we need, never the config.
+        parser = """import json, sys, yaml
+from pathlib import Path
+config = yaml.safe_load(Path(sys.argv[1]).read_text())
+if config is None:
+    config = {}
+if not isinstance(config, dict):
+    raise ValueError('Expected a YAML mapping.')
+print(json.dumps({str(key).lower(): value for key, value in config.items()}.get('ignorefile')))
+"""
+        parsed = subprocess.run([python, "-I", "-c", parser, str(config)], env=environment,
+                                capture_output=True, text=True, check=True, timeout=30)
+        value = json.loads(parsed.stdout)
+        if value is not None:
+            if not isinstance(value, str):
+                raise ValueError("Trivy ignorefile must be a local file path or an empty string.")
+            ignorefile = value
+            explicit_ignore = True
+    if ignorefile and (explicit_ignore or (root / ignorefile).exists() or (root / ignorefile).is_symlink()):
+        files.append(str(safe_path(root, ignorefile)))
+    return files
+
+
+def npm_audit_config(root: Path, directory: Path) -> tuple[list[str], dict]:
+    workspace = Path(os.environ.get("GITHUB_WORKSPACE", str(root))).resolve()
+    if not directory.is_relative_to(workspace):
+        raise ValueError("npm audit directories must stay inside the checked-out repository.")
+    for ancestor in workspace.parents:
+        manifest = ancestor / "package.json"
+        if manifest.is_symlink():
+            raise ValueError("npm workspace configurations outside the checkout are unsupported.")
+        if manifest.is_file():
+            payload = json.loads(manifest.read_text())
+            if not isinstance(payload, dict) or payload.get("workspaces"):
+                raise ValueError("npm workspace configurations outside the checkout are unsupported.")
+    files = []
+    settings = {}
+    while directory.is_relative_to(workspace):
+        relative = directory.relative_to(workspace)
+        config = directory / ".npmrc"
+        if config.exists() or config.is_symlink():
+            files.append(str(safe_path(workspace, (relative / ".npmrc").as_posix())))
+        manifest = directory / "package.json"
+        if manifest.exists() or manifest.is_symlink():
+            safe_manifest = safe_path(workspace, (relative / "package.json").as_posix())
+            payload = json.loads(safe_manifest.read_text())
+            if not isinstance(payload, dict):
+                raise ValueError("npm project configuration is invalid.")
+            settings[relative.as_posix()] = {"workspaces": payload.get("workspaces")}
+        if directory == workspace:
+            break
+        directory = directory.parent
+    return files, settings
 
 
 def semgrep_config(root: Path, value: str) -> str:
@@ -416,9 +499,7 @@ class Scanner:
                 command += ["--skip-dirs", exclude]
             command += ["."]
             settings["excludes"] = excludes
-            for filename in ("trivy.yaml", ".trivyignore", ".trivyignore.yaml"):
-                if (self.root / filename).exists():
-                    configs.append(str(safe_path(self.root, filename)))
+            configs.extend(trivy_config_files(self.root, self.reports.parent / "tools", self.environment))
         else:
             executable = safe_path(self.root, "vendor/bin/phpstan")
             command = [str(executable), "analyse", "--error-format=json", "--no-progress", "--memory-limit=1G"]
@@ -446,6 +527,8 @@ class Scanner:
         path_input = input_value(name.replace("_", "-") + "-paths")
         directories = split_items(path_input) or ["."]
         projects = []
+        configs = []
+        project_settings = {}
         findings = 0
         executable = self.executable("composer" if name == "composer_audit" else "npm")
         for relative in directories:
@@ -457,6 +540,19 @@ class Scanner:
                 for filename in expected + (["composer.json"] if name == "composer_audit" else ["package.json"]):
                     if (directory / filename).exists():
                         safe_path(self.root, (Path(relative) / filename).as_posix())
+                if name == "composer_audit" and (directory / "composer.json").is_file():
+                    manifest = json.loads((directory / "composer.json").read_text())
+                    if not isinstance(manifest, dict) or not isinstance(manifest.get("config", {}), dict):
+                        raise ValueError("Composer audit configuration is invalid.")
+                    configuration = manifest.get("config", {})
+                    project_settings[directory.relative_to(self.root).as_posix()] = {
+                        "audit": configuration.get("audit"), "policy": configuration.get("policy"),
+                        "repositories": manifest.get("repositories"),
+                    }
+                elif name == "npm_audit":
+                    npm_configs, npm_settings = npm_audit_config(self.root, directory)
+                    configs.extend(npm_configs)
+                    project_settings[directory.relative_to(self.root).as_posix()] = {"ancestors": npm_settings}
                 if name == "composer_audit":
                     locked = json.loads((directory / "composer.lock").read_text())
                     if not isinstance(locked.get("packages"), list) or not isinstance(locked.get("packages-dev"), list):
@@ -483,7 +579,7 @@ class Scanner:
         status = "skipped" if statuses == {"skipped"} else ("completed" if statuses == {"completed"} else "failed")
         return {"status": status, **({"report": report.name} if status != "skipped" else {}), "findings": findings,
                 "findings_in_fail_severities": findings,
-                "scope_hash": scope_hash(self.root, name, {"paths": directories}, []),
+                "scope_hash": scope_hash(self.root, name, {"paths": directories, "projects": project_settings}, configs),
                 **({"reason": "One or more dependency projects failed or provided incomplete audit coverage."} if status == "failed" else {})}
 
 
@@ -583,7 +679,7 @@ def send_upload(endpoint: str, token: str, body: bytes, content_type: str, *, at
         except urllib.error.HTTPError as error:
             if error.code not in {429, 500, 502, 503, 504} or attempt == attempts - 1:
                 raise ValueError(f"Upload returned HTTP {error.code}.") from None
-        except (urllib.error.URLError, TimeoutError):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.RemoteDisconnected, http.client.IncompleteRead):
             if attempt == attempts - 1:
                 raise ValueError("Upload could not reach the ingest endpoint.") from None
         time.sleep(2 ** attempt)

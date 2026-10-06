@@ -1,4 +1,5 @@
 import io
+import http.client
 import json
 import os
 import subprocess
@@ -180,6 +181,198 @@ class ScannerTests(unittest.TestCase):
         with patch.object(runner, "executable", return_value="composer"), patch.object(scan, "run_command", side_effect=fake_command):
             self.assertEqual("failed", runner.audit("composer_audit")["status"])
 
+    def audit_state(self, name):
+        runner = scan.Scanner(self.root, self.reports, "general")
+        def fake_command(command, root, environment, report):
+            payload = {"advisories": []} if name == "composer_audit" else {
+                "vulnerabilities": {}, "metadata": {"vulnerabilities": {"total": 0}},
+            }
+            scan.save_json(report, payload)
+            return 0, ""
+        with patch.object(runner, "executable", return_value="audit"), patch.object(scan, "run_command", side_effect=fake_command):
+            return runner.audit(name)
+
+    def test_composer_scope_tracks_each_project_audit_configuration(self):
+        os.environ["SCAN_COMPOSER_AUDIT_PATHS"] = "one,two"
+        lock = {"packages": [{"name": "vendor/pkg", "version": "1.0.0"}], "packages-dev": []}
+        for directory in ("one", "two"):
+            self.write(f"{directory}/composer.lock", json.dumps(lock))
+            manifest = self.write(f"{directory}/composer.json", '{}')
+        original = self.audit_state("composer_audit")["scope_hash"]
+        for configuration in (
+            {"config": {"audit": {"ignore": ["CVE-1234"]}}},
+            {"config": {"audit": {"ignore-severity": ["low"]}}},
+            {"config": {"policy": {"advisories": {"audit": "ignore"}}}},
+            {"repositories": {"packagist.org": False}},
+        ):
+            for directory in ("one", "two"):
+                with self.subTest(configuration=configuration, directory=directory):
+                    changed = self.root / directory / "composer.json"
+                    changed.write_text(json.dumps(configuration))
+                    state = self.audit_state("composer_audit")
+                    self.assertEqual("completed", state["status"])
+                    self.assertNotEqual(original, state["scope_hash"])
+                    changed.write_text('{}')
+                    self.assertEqual(original, self.audit_state("composer_audit")["scope_hash"])
+        lock["packages"][0]["version"] = "2.0.0"
+        self.write("two/composer.lock", json.dumps(lock))
+        manifest.write_text('{"require":{"vendor/pkg":"^2.0"},"description":"Updated dependencies"}')
+        self.assertEqual(original, self.audit_state("composer_audit")["scope_hash"])
+
+    def test_npm_scope_tracks_each_project_config_and_workspaces(self):
+        os.environ["SCAN_NPM_AUDIT_PATHS"] = "one,two"
+        for directory in ("one", "two"):
+            self.write(f"{directory}/package-lock.json", '{}')
+            self.write(f"{directory}/package.json", '{}')
+        original = self.audit_state("npm_audit")["scope_hash"]
+        for directory in ("one", "two"):
+            with self.subTest(directory=directory):
+                config = self.write(f"{directory}/.npmrc", "omit=dev\n")
+                first = self.audit_state("npm_audit")
+                self.assertEqual("completed", first["status"])
+                self.assertNotEqual(original, first["scope_hash"])
+                config.write_text("omit=optional\n")
+                self.assertNotEqual(first["scope_hash"], self.audit_state("npm_audit")["scope_hash"])
+                config.unlink()
+                self.assertEqual(original, self.audit_state("npm_audit")["scope_hash"])
+        self.write("two/package-lock.json", '{"lockfileVersion":3,"packages":{"":{"version":"2.0.0"}}}')
+        self.write("two/package.json", '{"dependencies":{"pkg":"^2.0"}}')
+        self.assertEqual(original, self.audit_state("npm_audit")["scope_hash"])
+        self.write("two/package.json", '{"workspaces":["packages/*"]}')
+        self.assertNotEqual(original, self.audit_state("npm_audit")["scope_hash"])
+
+    def test_npm_rejects_external_config_and_keeps_other_projects(self):
+        os.environ["SCAN_NPM_AUDIT_PATHS"] = "one,two"
+        for directory in ("one", "two"):
+            self.write(f"{directory}/package-lock.json", '{}')
+        outside = Path(self.temporary.name) / "outside.npmrc"
+        outside.write_text("omit=dev\n")
+        (self.root / "two/.npmrc").symlink_to(outside)
+        state = self.audit_state("npm_audit")
+        self.assertEqual("failed", state["status"])
+        projects = json.loads((self.reports / "npm_audit.json").read_text())["projects"]
+        self.assertEqual(["completed", "failed"], [project["status"] for project in projects])
+
+    def test_npm_scope_tracks_inherited_workspace_root_configuration(self):
+        os.environ["SCAN_NPM_AUDIT_PATHS"] = "packages/example"
+        root_manifest = self.write("package.json", '{"workspaces":["packages/*"],"dependencies":{"pkg":"^1.0"}}')
+        root_config = self.write(".npmrc", "omit=dev\n")
+        self.write("packages/example/package.json", '{"name":"example","dependencies":{"pkg":"^1.0"}}')
+        lockfile = self.write("packages/example/package-lock.json", '{}')
+        first = self.audit_state("npm_audit")
+        self.assertEqual("completed", first["status"])
+        root_config.write_text("omit=optional\n")
+        self.assertNotEqual(first["scope_hash"], self.audit_state("npm_audit")["scope_hash"])
+        root_config.write_text("omit=dev\n")
+        root_manifest.write_text('{"workspaces":["packages/example"],"dependencies":{"pkg":"^1.0"}}')
+        self.assertNotEqual(first["scope_hash"], self.audit_state("npm_audit")["scope_hash"])
+        root_manifest.write_text('{"workspaces":["packages/*"],"dependencies":{"pkg":"^2.0"},"description":"Changed dependencies"}')
+        lockfile.write_text('{"lockfileVersion":3,"packages":{"":{"version":"2.0.0"}}}')
+        self.write("package-lock.json", '{"lockfileVersion":3,"packages":{"":{"version":"2.0.0"}}}')
+        self.write("packages/example/package.json", '{"name":"example","dependencies":{"pkg":"^2.0"}}')
+        self.assertEqual(first["scope_hash"], self.audit_state("npm_audit")["scope_hash"])
+
+    def test_npm_scope_inherits_checkout_configuration_above_working_directory(self):
+        checkout_config = self.write(".npmrc", "omit=dev\n")
+        self.write("package.json", '{"workspaces":["apps/client"]}')
+        self.write("apps/client/package.json", '{"name":"client"}')
+        self.write("apps/client/package-lock.json", '{}')
+        os.environ["SCAN_NPM_AUDIT_PATHS"] = "client"
+        runner = scan.Scanner(self.root / "apps", self.reports, "general")
+        def fake_command(command, root, environment, report):
+            scan.save_json(report, {"vulnerabilities": {}, "metadata": {"vulnerabilities": {"total": 0}}})
+            return 0, ""
+        with patch.object(runner, "executable", return_value="npm"), patch.object(scan, "run_command", side_effect=fake_command):
+            first = runner.audit("npm_audit")
+            checkout_config.write_text("omit=optional\n")
+            second = runner.audit("npm_audit")
+        self.assertEqual("completed", first["status"])
+        self.assertEqual("completed", second["status"])
+        self.assertNotEqual(first["scope_hash"], second["scope_hash"])
+
+    def test_npm_inherited_configs_reject_symlinks_outside_checkout(self):
+        directory = self.root / "packages/example"
+        directory.mkdir(parents=True)
+        outside = Path(self.temporary.name) / "outside"
+        outside.write_text('{"workspaces":["packages/*"]}')
+        for filename in (".npmrc", "package.json"):
+            config = self.root / filename
+            config.symlink_to(outside)
+            with self.subTest(filename=filename), self.assertRaises(ValueError):
+                scan.npm_audit_config(self.root, directory)
+            config.unlink()
+
+    def test_npm_rejects_workspace_inheritance_from_outside_checkout(self):
+        outside_manifest = Path(self.temporary.name) / "package.json"
+        outside_manifest.write_text('{"workspaces":["repository"]}')
+        self.write("package.json", '{"name":"example"}')
+        with self.assertRaisesRegex(ValueError, "outside the checkout"):
+            scan.npm_audit_config(self.root, self.root)
+
+    def trivy_state(self):
+        runner = scan.Scanner(self.root, self.reports, "general")
+        def fake_command(command, root, environment, report=None):
+            scan.save_json(self.reports / "trivy.json", {"SchemaVersion": 2, "Results": []})
+            return 0, ""
+        with patch.object(runner, "executable", return_value="trivy"), patch.object(scan, "install", return_value=sys.executable), patch.object(scan, "run_command", side_effect=fake_command):
+            return runner.raw_scan("trivy")
+
+    def test_trivy_scope_tracks_effective_ignorefile_for_yaml_forms(self):
+        ignored = self.write("config/custom # ignore.yaml", "vulnerabilities: []\n")
+        self.write("yaml.py", "raise RuntimeError('Repository module must not be loaded')\n")
+        for content in (
+            "ignorefile: 'config/custom # ignore.yaml' # a comment\n",
+            'ignorefile: "config/custom # ignore.yaml"\n',
+            "ignorefile: >-\n  config/custom # ignore.yaml\n",
+            "shared: &ignore 'config/custom # ignore.yaml'\nignorefile: *ignore\n",
+            "defaults: &defaults {ignorefile: 'config/custom # ignore.yaml'}\n<<: *defaults\n",
+            '{"ignorefile":"config/custom # ignore.yaml"}',
+        ):
+            with self.subTest(content=content):
+                self.write("trivy.yaml", content)
+                ignored.write_text("vulnerabilities: []\n")
+                original = self.trivy_state()
+                self.assertEqual("completed", original["status"])
+                ignored.write_text("vulnerabilities:\n  - id: CVE-1234\n")
+                self.assertNotEqual(original["scope_hash"], self.trivy_state()["scope_hash"])
+
+    def test_trivy_defaults_and_disabled_ignorefile(self):
+        original = self.trivy_state()["scope_hash"]
+        ignored = self.write(".trivyignore", "CVE-1234\n")
+        self.assertNotEqual(original, self.trivy_state()["scope_hash"])
+        ignored.write_text("CVE-5678\n")
+        config = self.write("trivy.yaml", 'ignorefile: ""\n')
+        disabled = self.trivy_state()["scope_hash"]
+        ignored.write_text("CVE-9999\n")
+        self.assertEqual(disabled, self.trivy_state()["scope_hash"])
+        config.write_text("ignorefile: null\n")
+        original = self.trivy_state()["scope_hash"]
+        ignored.write_text("CVE-0000\n")
+        self.assertNotEqual(original, self.trivy_state()["scope_hash"])
+
+    def test_trivy_rejects_missing_external_and_nonfile_ignore_paths(self):
+        outside = Path(self.temporary.name) / "outside.ignore"
+        outside.write_text("CVE-1234\n")
+        (self.root / "external.ignore").symlink_to(outside)
+        (self.root / "config").mkdir()
+        runner = scan.Scanner(self.root, self.reports, "general")
+        for value in ("missing.ignore", "../outside.ignore", str(outside), "external.ignore", "config"):
+            self.write("trivy.yaml", json.dumps({"ignorefile": value}))
+            with self.subTest(value=value), patch.object(runner, "executable", return_value="trivy"), patch.object(scan, "install", return_value=sys.executable), patch.object(scan, "run_command") as command:
+                with self.assertRaises((ValueError, OSError)):
+                    runner.raw_scan("trivy")
+                command.assert_not_called()
+
+    def test_trivy_rejects_invalid_yaml_and_ignorefile_types(self):
+        runner = scan.Scanner(self.root, self.reports, "general")
+        for content in ("ignorefile: [unterminated", "ignorefile: [one, two]\n", "- ignorefile\n", "ignorefile: !!python/object/apply:os.system ['touch PWNED']\n"):
+            self.write("trivy.yaml", content)
+            with self.subTest(content=content), patch.object(runner, "executable", return_value="trivy"), patch.object(scan, "install", return_value=sys.executable), patch.object(scan, "run_command") as command:
+                with self.assertRaises((ValueError, subprocess.SubprocessError)):
+                    runner.raw_scan("trivy")
+                command.assert_not_called()
+                self.assertFalse((self.root / "PWNED").exists())
+
     def test_semgrep_scope_includes_parent_and_nested_gitignores(self):
         parent = self.write(".gitignore", "parent-ignore")
         nested = self.write("app/nested/.gitignore", "nested-ignore")
@@ -249,6 +442,34 @@ class ScannerTests(unittest.TestCase):
         self.write("dynamic.php", "<?php return [];\n")
         with self.assertRaises(ValueError):
             scan.phpstan_config_files(self.root, config)
+
+    def test_phpstan_include_comments_and_quoted_hashes(self):
+        baseline = self.write("config/base # rules.neon", "parameters:\n    ignoreErrors: []\n")
+        config = self.write("phpstan.neon", "")
+        for content in (
+            "includes: # Extensions\n# full-line comment\n    - 'config/base # rules.neon' # Baseline\nparameters: # settings\n    level: 5\n",
+            'includes: ["config/base # rules.neon"] # Baseline\n',
+        ):
+            with self.subTest(content=content):
+                config.write_text(content)
+                files = scan.phpstan_config_files(self.root, config)
+                self.assertEqual({str(config), str(baseline)}, set(files))
+                original = scan.scope_hash(self.root, "phpstan", {}, files)
+                baseline.write_text("parameters:\n    ignoreErrors: [changed]\n")
+                self.assertNotEqual(original, scan.scope_hash(self.root, "phpstan", {}, files))
+                baseline.write_text("parameters:\n    ignoreErrors: []\n")
+
+    def test_phpstan_unquoted_include_trailing_comment_runs(self):
+        self.write("vendor/bin/phpstan", "#!/usr/bin/env php\n")
+        self.write("phpstan.neon", "includes: # Extensions\n    - config/base.neon # Baseline\n")
+        self.write("config/base.neon", "parameters:\n    level: 5\n")
+        runner = scan.Scanner(self.root, self.reports, "general")
+        def fake_command(command, root, environment, report):
+            scan.save_json(report, {"files": {}, "totals": {"file_errors": 0}, "errors": []})
+            return 0, ""
+        with patch.object(scan, "run_command", side_effect=fake_command) as command:
+            self.assertEqual("completed", runner.raw_scan("phpstan")["status"])
+            command.assert_called_once()
 
     def test_actual_checkout_sha_is_used_instead_of_event_sha(self):
         os.environ.update(GITHUB_SHA="event-sha", GITHUB_REPOSITORY="owner/repo", GITHUB_REPOSITORY_ID="123")
@@ -327,6 +548,56 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(2, opener.open.call_count)
         request = opener.open.call_args.args[0]
         self.assertEqual("Bearer TOKEN", request.get_header("Authorization"))
+
+    def test_upload_retries_disconnects_before_headers_and_during_response_read(self):
+        failures = (
+            http.client.RemoteDisconnected("server closed before headers"),
+            ConnectionResetError("connection reset"),
+            ConnectionAbortedError("connection aborted"),
+            BrokenPipeError("broken pipe"),
+            http.client.IncompleteRead(b'partial response'),
+        )
+        for failure in failures:
+            for phase in ("headers", "body"):
+                with self.subTest(failure=type(failure).__name__, phase=phase):
+                    response = Mock()
+                    response.__enter__ = Mock(return_value=response)
+                    response.__exit__ = Mock(return_value=False)
+                    response.read.return_value = b'{"scan_batch_id":42}'
+                    opener = Mock()
+                    if phase == "headers":
+                        opener.open.side_effect = [failure, response]
+                    else:
+                        opener.open.return_value = response
+                        response.read.side_effect = [failure, b'{"scan_batch_id":42}']
+                    with patch.object(scan.urllib.request, "build_opener", return_value=opener), patch.object(scan.time, "sleep") as sleep:
+                        self.assertEqual("42", scan.send_upload("https://example.com", "TOKEN", b"body", "multipart/form-data"))
+                        sleep.assert_called_once_with(1)
+                    self.assertEqual(2, opener.open.call_count)
+                    self.assertEqual([b"body", b"body"], [call.args[0].data for call in opener.open.call_args_list])
+
+    def test_upload_transport_retries_stop_at_attempt_limit_without_leaking_details(self):
+        for failure in (http.client.RemoteDisconnected("SECRET details"), ConnectionResetError("SECRET details"), http.client.IncompleteRead(b'SECRET details')):
+            with self.subTest(failure=type(failure).__name__):
+                opener = Mock()
+                opener.open.side_effect = failure
+                with patch.object(scan.urllib.request, "build_opener", return_value=opener), patch.object(scan.time, "sleep") as sleep, self.assertRaises(ValueError) as error:
+                    scan.send_upload("https://example.com", "SECRET_TOKEN", b"body", "multipart/form-data", attempts=3)
+                self.assertEqual(3, opener.open.call_count)
+                self.assertEqual([1, 2], [call.args[0] for call in sleep.call_args_list])
+                self.assertNotIn("SECRET", str(error.exception))
+
+    def test_invalid_upload_response_is_not_retried(self):
+        response = Mock()
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        response.read.return_value = b'{"scan_batch_id":"invalid identifier"}'
+        opener = Mock()
+        opener.open.return_value = response
+        with patch.object(scan.urllib.request, "build_opener", return_value=opener), patch.object(scan.time, "sleep") as sleep, self.assertRaises(ValueError):
+            scan.send_upload("https://example.com", "TOKEN", b"body", "multipart/form-data")
+        self.assertEqual(1, opener.open.call_count)
+        sleep.assert_not_called()
 
     def test_authentication_failure_and_redirect_are_not_retried(self):
         for status in (401, 403, 302, 422):
@@ -439,6 +710,26 @@ class HttpIntegrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             scan.send_upload(endpoint + "/ingest", "runtime-test-token", b"body", "multipart/form-data")
         self.assertEqual(["/ingest"], received)
+
+    def test_real_disconnect_before_headers_retries_identical_payload(self):
+        received = []
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append(self.rfile.read(int(self.headers["Content-Length"])))
+                if len(received) < 3:
+                    self.close_connection = True
+                    return
+                self.send_response(202)
+                self.end_headers()
+                self.wfile.write(b'{"scan_batch_id":123}')
+
+            def log_message(self, *_):
+                pass
+
+        endpoint = self.serve(Handler)
+        with patch.object(scan.time, "sleep"):
+            self.assertEqual("123", scan.send_upload(endpoint + "/ingest", "runtime-test-token", b"body", "multipart/form-data"))
+        self.assertEqual([b"body"] * 3, received)
 
 
 if __name__ == "__main__":

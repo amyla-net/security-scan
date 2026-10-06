@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 VERSIONS = {"gitleaks": "8.30.1", "semgrep": "1.179.0", "trivy": "0.75.0"}
+PYYAML_VERSION = "6.0.3"
 BINARY_RELEASES = {
     "gitleaks": (
         "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz",
@@ -26,19 +27,20 @@ def install(name: str, directory: Path, environment: dict[str, str]) -> str:
     if platform.system() != "Linux" or platform.machine() not in {"x86_64", "amd64"}:
         raise ValueError("This release supports Ubuntu x64 runners only.")
     directory.mkdir(parents=True, exist_ok=True)
-    if name == "semgrep":
-        venv = directory / "semgrep-venv"
+    if name in {"semgrep", "pyyaml"}:
+        venv = directory / f"{name}-venv"
+        package = f"semgrep=={VERSIONS[name]}" if name == "semgrep" else f"PyYAML=={PYYAML_VERSION}"
         subprocess.run(
             ["python3", "-m", "venv", str(venv)], env=environment,
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
         )
         subprocess.run(
             [str(venv / "bin/python"), "-m", "pip", "install", "--disable-pip-version-check",
-             "--no-input", "--quiet", f"semgrep=={VERSIONS[name]}"],
+             "--no-input", "--quiet", package],
             env=environment, check=True, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, timeout=600,
         )
-        return str(venv / "bin/semgrep")
+        return str(venv / ("bin/semgrep" if name == "semgrep" else "bin/python"))
 
     url, expected_digest = BINARY_RELEASES[name]
     request = urllib.request.Request(url, headers={"User-Agent": "amyla-security-scan"})
