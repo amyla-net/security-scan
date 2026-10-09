@@ -166,19 +166,19 @@ def assert_full_git_history(root: Path, environment: dict[str, str]) -> None:
 
 
 def neon_without_comment(line: str) -> str:
-    quote = None
-    escaped = False
-    for index, character in enumerate(line):
-        if escaped:
-            escaped = False
-        elif quote and character == "\\":
-            escaped = True
-        elif character == quote:
-            quote = None
-        elif quote is None and character in {"'", '"'}:
-            quote = character
-        elif quote is None and character == "#":
+    # Consume NEON strings and literals as tokens: a hash inside a literal
+    # belongs to the path, whereas a hash at a token boundary starts a comment.
+    token = re.compile(r"""
+        '(?:''|[^'\n])*' | "(?:\\.|[^"\\\n])*" |
+        (?:[^#"',:=[\]{}()\n\t `-]|(?<!["'])[:-][^"',=[\]{}()\n\t ])
+        (?:[^,:=\]})(\n\t ]+|:(?![\n\t ,\]})]|$)|[ \t]+[^#,:=\]})(\n\t ])*
+        """, re.VERBOSE)
+    index = 0
+    while index < len(line):
+        if line[index] == "#":
             return line[:index]
+        matched = token.match(line, index)
+        index = matched.end() if matched else index + 1
     return line
 
 
@@ -235,9 +235,20 @@ def trivy_config_files(root: Path, tools: Path, environment: dict[str, str]) -> 
         python = install("pyyaml", tools, environment)
         # Use a safe YAML loader in an isolated interpreter so repository modules
         # cannot shadow the parser. Emit only the setting we need, never the config.
-        parser = """import json, sys, yaml
+        parser = """import json, re, sys, yaml
 from pathlib import Path
-config = yaml.safe_load(Path(sys.argv[1]).read_text())
+class TrivyLoader(yaml.SafeLoader):
+    pass
+# Go's YAML resolver recognizes true/false as booleans, but leaves YAML 1.1
+# spellings such as yes/no/on/off as strings. Keep the other safe resolvers.
+TrivyLoader.yaml_implicit_resolvers = {
+    key: [(tag, pattern) for tag, pattern in resolvers
+          if tag != 'tag:yaml.org,2002:bool']
+    for key, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+TrivyLoader.add_implicit_resolver('tag:yaml.org,2002:bool',
+    re.compile(r'^(?:true|True|TRUE|false|False|FALSE)$'), list('tTfF'))
+config = yaml.load(Path(sys.argv[1]).read_text(), Loader=TrivyLoader)
 if config is None:
     config = {}
 if not isinstance(config, dict):
@@ -266,7 +277,7 @@ def npm_audit_config(root: Path, directory: Path) -> tuple[list[str], dict]:
         if manifest.is_symlink():
             raise ValueError("npm workspace configurations outside the checkout are unsupported.")
         if manifest.is_file():
-            payload = json.loads(manifest.read_text())
+            payload = json.loads(manifest.read_text(encoding="utf-8-sig"))
             if not isinstance(payload, dict) or payload.get("workspaces"):
                 raise ValueError("npm workspace configurations outside the checkout are unsupported.")
     files = []
@@ -279,7 +290,7 @@ def npm_audit_config(root: Path, directory: Path) -> tuple[list[str], dict]:
         manifest = directory / "package.json"
         if manifest.exists() or manifest.is_symlink():
             safe_manifest = safe_path(workspace, (relative / "package.json").as_posix())
-            payload = json.loads(safe_manifest.read_text())
+            payload = json.loads(safe_manifest.read_text(encoding="utf-8-sig"))
             if not isinstance(payload, dict):
                 raise ValueError("npm project configuration is invalid.")
             settings[relative.as_posix()] = {"workspaces": payload.get("workspaces")}

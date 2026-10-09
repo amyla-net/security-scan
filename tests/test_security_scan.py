@@ -241,6 +241,22 @@ class ScannerTests(unittest.TestCase):
         self.write("two/package.json", '{"workspaces":["packages/*"]}')
         self.assertNotEqual(original, self.audit_state("npm_audit")["scope_hash"])
 
+    def test_npm_accepts_bom_manifests_in_projects_and_workspace_ancestors(self):
+        os.environ["SCAN_NPM_AUDIT_PATHS"] = "packages/example"
+        workspace = self.write("package.json", '{"workspaces":["packages/*"]}')
+        project = self.write("packages/example/package.json", '{}')
+        self.write("packages/example/package-lock.json", '{}')
+        ancestor = Path(self.temporary.name) / "package.json"
+        ancestor.write_text('{}')
+        original = self.audit_state("npm_audit")
+        self.assertEqual("completed", original["status"])
+        for manifest in (project, workspace, ancestor):
+            with self.subTest(manifest=manifest.name, directory=str(manifest.parent)):
+                manifest.write_bytes(b'\xef\xbb\xbf' + manifest.read_bytes())
+                state = self.audit_state("npm_audit")
+                self.assertEqual("completed", state["status"])
+                self.assertEqual(original["scope_hash"], state["scope_hash"])
+
     def test_npm_rejects_external_config_and_keeps_other_projects(self):
         os.environ["SCAN_NPM_AUDIT_PATHS"] = "one,two"
         for directory in ("one", "two"):
@@ -335,6 +351,17 @@ class ScannerTests(unittest.TestCase):
                 self.assertEqual("completed", original["status"])
                 ignored.write_text("vulnerabilities:\n  - id: CVE-1234\n")
                 self.assertNotEqual(original["scope_hash"], self.trivy_state()["scope_hash"])
+
+    def test_trivy_unquoted_yaml11_boolean_words_are_ignore_paths(self):
+        for word in ("yes", "no", "on", "off", "y", "n"):
+            for value in (word, word.title(), word.upper()):
+                with self.subTest(value=value):
+                    self.write("trivy.yaml", f"ignorefile: {value}\n")
+                    ignored = self.write(value, "CVE-1234\n")
+                    original = self.trivy_state()
+                    self.assertEqual("completed", original["status"])
+                    ignored.write_text("CVE-5678\n")
+                    self.assertNotEqual(original["scope_hash"], self.trivy_state()["scope_hash"])
 
     def test_trivy_defaults_and_disabled_ignorefile(self):
         original = self.trivy_state()["scope_hash"]
@@ -470,6 +497,44 @@ class ScannerTests(unittest.TestCase):
         with patch.object(scan, "run_command", side_effect=fake_command) as command:
             self.assertEqual("completed", runner.raw_scan("phpstan")["status"])
             command.assert_called_once()
+
+    def test_phpstan_unquoted_embedded_hash_includes_run_and_change_scope(self):
+        self.write("vendor/bin/phpstan", "#!/usr/bin/env php\n")
+        baseline = self.write("config/base#rules.neon", "parameters:\n    level: 5\n")
+        # A truncated path also exists, so checking success alone would miss
+        # hashing the wrong configuration file.
+        self.write("config/base", "parameters:\n    level: 0\n")
+        config = self.write("phpstan.neon", "")
+        runner = scan.Scanner(self.root, self.reports, "general")
+        def fake_command(command, root, environment, report):
+            scan.save_json(report, {"files": {}, "totals": {"file_errors": 0}, "errors": []})
+            return 0, ""
+        for content in (
+            "includes:\n    - config/base#rules.neon # Baseline\n",
+            "includes: [config/base#rules.neon]# Baseline\n",
+        ):
+            with self.subTest(content=content), patch.object(scan, "run_command", side_effect=fake_command):
+                config.write_text(content)
+                self.assertEqual({str(config), str(baseline)}, set(scan.phpstan_config_files(self.root, config)))
+                original = runner.raw_scan("phpstan")
+                self.assertEqual("completed", original["status"])
+                baseline.write_text("parameters:\n    level: 6\n")
+                self.assertNotEqual(original["scope_hash"], runner.raw_scan("phpstan")["scope_hash"])
+                baseline.write_text("parameters:\n    level: 5\n")
+
+    def test_neon_comment_boundaries_follow_tokens(self):
+        for line, expected in (
+            ("# comment", ""),
+            ("includes: # comment", "includes: "),
+            ("includes:#literal", "includes:#literal"),
+            ("[base.neon]# comment", "[base.neon]"),
+            ("'base.neon'# comment", "'base.neon'"),
+            ("base#rules.neon # comment", "base#rules.neon "),
+            ("base:#rules.neon # comment", "base:#rules.neon "),
+            ("'base''#rules.neon' # comment", "'base''#rules.neon' "),
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(expected, scan.neon_without_comment(line))
 
     def test_actual_checkout_sha_is_used_instead_of_event_sha(self):
         os.environ.update(GITHUB_SHA="event-sha", GITHUB_REPOSITORY="owner/repo", GITHUB_REPOSITORY_ID="123")
