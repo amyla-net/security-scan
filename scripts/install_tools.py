@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import os
 import platform
 import subprocess
 import tarfile
@@ -11,6 +12,7 @@ from pathlib import Path
 
 VERSIONS = {"gitleaks": "8.30.1", "semgrep": "1.179.0", "trivy": "0.75.0"}
 PYYAML_VERSION = "6.0.3"
+REQUIREMENTS = Path(__file__).resolve().parent / "requirements"
 BINARY_RELEASES = {
     "gitleaks": (
         "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz",
@@ -29,15 +31,15 @@ def install(name: str, directory: Path, environment: dict[str, str]) -> str:
     directory.mkdir(parents=True, exist_ok=True)
     if name in {"semgrep", "pyyaml"}:
         venv = directory / f"{name}-venv"
-        package = f"semgrep=={VERSIONS[name]}" if name == "semgrep" else f"PyYAML=={PYYAML_VERSION}"
         subprocess.run(
-            ["python3", "-m", "venv", str(venv)], env=environment,
+            ["python3", "-I", "-m", "venv", str(venv)], env=environment,
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
         )
         subprocess.run(
-            [str(venv / "bin/python"), "-m", "pip", "install", "--disable-pip-version-check",
-             "--no-input", "--quiet", package],
-            env=environment, check=True, stdout=subprocess.DEVNULL,
+            [str(venv / "bin/python"), "-I", "-m", "pip", "--isolated", "install", "--disable-pip-version-check",
+             "--no-input", "--quiet", "--no-cache-dir", "--index-url", "https://pypi.org/simple",
+             "--require-hashes", "--only-binary=:all:", "--requirement", str(REQUIREMENTS / f"{name}.txt")],
+            env={**environment, "PIP_CONFIG_FILE": os.devnull}, check=True, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, timeout=600,
         )
         return str(venv / ("bin/semgrep" if name == "semgrep" else "bin/python"))

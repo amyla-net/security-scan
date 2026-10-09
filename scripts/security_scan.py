@@ -412,9 +412,26 @@ def valid_report(scanner: str, payload: object, code: int, stderr: str = "") -> 
     if not isinstance(payload, dict):
         return False
     if scanner == "semgrep":
-        return code == 0 and isinstance(payload.get("results"), list) and not payload.get("errors")
+        return (code == 0 and isinstance(payload.get("results"), list)
+                and isinstance(payload.get("errors"), list) and not payload["errors"])
     if scanner == "trivy":
-        return code == 0 and payload.get("SchemaVersion") == 2 and isinstance(payload.get("Results", []), list)
+        # Empty filesystem scans legitimately omit Results. Require the scan
+        # identity instead of accepting a bare SchemaVersion as a full report.
+        results = payload.get("Results", [])
+        if (code != 0 or type(payload.get("SchemaVersion")) is not int or payload["SchemaVersion"] != 2
+                or payload.get("ArtifactType") != "filesystem"
+                or not isinstance(payload.get("ArtifactName"), str) or not payload["ArtifactName"]
+                or not isinstance(results, list) or payload.get("error")):
+            return False
+        for result in results:
+            if (not isinstance(result, dict) or not isinstance(result.get("Target"), str)
+                    or not result["Target"]):
+                return False
+            for key in ("Vulnerabilities", "Misconfigurations", "Secrets", "Licenses"):
+                findings = result.get(key, [])
+                if not isinstance(findings, list) or not all(isinstance(finding, dict) for finding in findings):
+                    return False
+        return True
     if scanner == "composer_audit":
         stderr = "\n".join(line for line in stderr.splitlines() if not (
             line.startswith("Composer could not detect the root package (")
@@ -423,8 +440,12 @@ def valid_report(scanner: str, payload: object, code: int, stderr: str = "") -> 
         return (code in {0, 1, 2, 3} and isinstance(payload.get("advisories"), (dict, list))
                 and not payload.get("error") and not re.search(r"(failed|unable|could not|incomplete|warning)", stderr, re.I))
     if scanner == "npm_audit":
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict) or not isinstance(metadata.get("vulnerabilities"), dict):
+            return False
+        total = metadata["vulnerabilities"].get("total")
         return (code in {0, 1} and isinstance(payload.get("vulnerabilities"), dict)
-                and isinstance(payload.get("metadata", {}).get("vulnerabilities"), dict) and not payload.get("error"))
+                and type(total) is int and total >= 0 and not payload.get("error"))
     if scanner == "phpstan":
         return (code in {0, 1} and isinstance(payload.get("files"), dict)
                 and isinstance(payload.get("totals"), dict) and not payload.get("errors"))
@@ -443,7 +464,7 @@ def counts(scanner: str, payload: dict | list) -> tuple[int, int]:
         count = sum(len(value) if isinstance(value, list) else 1 for value in payload["advisories"].values()) if isinstance(payload["advisories"], dict) else len(payload["advisories"])
         return count, count
     if scanner == "npm_audit":
-        count = int(payload["metadata"]["vulnerabilities"].get("total", 0))
+        count = payload["metadata"]["vulnerabilities"]["total"]
         return count, count
     total = gate = 0
     for result in payload.get("Results", []):
@@ -566,7 +587,8 @@ class Scanner:
                     project_settings[directory.relative_to(self.root).as_posix()] = {"ancestors": npm_settings}
                 if name == "composer_audit":
                     locked = json.loads((directory / "composer.lock").read_text())
-                    if not isinstance(locked.get("packages"), list) or not isinstance(locked.get("packages-dev"), list):
+                    if (not isinstance(locked, dict) or not isinstance(locked.get("packages"), list)
+                            or not isinstance(locked.get("packages-dev"), list)):
                         raise ValueError("Composer lockfile is invalid.")
                     if not locked["packages"] and not locked["packages-dev"]:
                         projects.append({"path": directory.relative_to(self.root).as_posix(), "status": "skipped", "reason": "No locked Composer dependencies to audit."})

@@ -170,6 +170,24 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual("skipped", project["status"])
         self.assertNotIn("result", project)
 
+    def test_malformed_composer_lock_keeps_later_valid_projects(self):
+        self.write("good/composer.lock", '{"packages":[{"name":"vendor/pkg","version":"1.0.0"}],"packages-dev":[]}')
+        os.environ["SCAN_COMPOSER_AUDIT_PATHS"] = "bad,good"
+        runner = scan.Scanner(self.root, self.reports, "general")
+        def fake_command(command, root, environment, report):
+            self.assertEqual(self.root / "good", root)
+            scan.save_json(report, {"advisories": {"pkg": [{"title": "vulnerability"}]}})
+            return 1, ""
+        for lock in ([], None, "invalid", 42, {"packages": {}, "packages-dev": []}):
+            with self.subTest(lock=lock), patch.object(runner, "executable", return_value="composer"), patch.object(scan, "run_command", side_effect=fake_command) as command:
+                self.write("bad/composer.lock", json.dumps(lock))
+                state = runner.audit("composer_audit")
+                self.assertEqual("failed", state["status"])
+                self.assertEqual(1, state["findings"])
+                command.assert_called_once()
+                projects = json.loads((self.reports / "composer_audit.json").read_text())["projects"]
+                self.assertEqual(["failed", "completed"], [project["status"] for project in projects])
+
     def test_partial_composer_project_coverage_fails_closed(self):
         self.write("empty/composer.lock", '{"packages":[],"packages-dev":[]}')
         self.write("full/composer.lock", '{"packages":[{"name":"vendor/pkg","version":"1.0.0"}],"packages-dev":[]}')
@@ -269,6 +287,27 @@ class ScannerTests(unittest.TestCase):
         projects = json.loads((self.reports / "npm_audit.json").read_text())["projects"]
         self.assertEqual(["completed", "failed"], [project["status"] for project in projects])
 
+    def test_malformed_npm_report_keeps_later_valid_projects(self):
+        for directory in ("bad", "good"):
+            self.write(f"{directory}/package-lock.json", '{}')
+            self.write(f"{directory}/package.json", '{}')
+        os.environ["SCAN_NPM_AUDIT_PATHS"] = "bad,good"
+        runner = scan.Scanner(self.root, self.reports, "general")
+        for metadata in ([], None, "invalid", {"vulnerabilities": []}, {"vulnerabilities": {}}, {"vulnerabilities": {"total": True}}):
+            def fake_command(command, root, environment, report):
+                scan.save_json(report, {
+                    "vulnerabilities": {},
+                    "metadata": metadata if root.name == "bad" else {"vulnerabilities": {"total": 1}},
+                })
+                return 1, ""
+            with self.subTest(metadata=metadata), patch.object(runner, "executable", return_value="npm"), patch.object(scan, "run_command", side_effect=fake_command) as command:
+                state = runner.audit("npm_audit")
+                self.assertEqual("failed", state["status"])
+                self.assertEqual(1, state["findings"])
+                self.assertEqual(2, command.call_count)
+                projects = json.loads((self.reports / "npm_audit.json").read_text())["projects"]
+                self.assertEqual(["failed", "completed"], [project["status"] for project in projects])
+
     def test_npm_scope_tracks_inherited_workspace_root_configuration(self):
         os.environ["SCAN_NPM_AUDIT_PATHS"] = "packages/example"
         root_manifest = self.write("package.json", '{"workspaces":["packages/*"],"dependencies":{"pkg":"^1.0"}}')
@@ -328,7 +367,7 @@ class ScannerTests(unittest.TestCase):
     def trivy_state(self):
         runner = scan.Scanner(self.root, self.reports, "general")
         def fake_command(command, root, environment, report=None):
-            scan.save_json(self.reports / "trivy.json", {"SchemaVersion": 2, "Results": []})
+            scan.save_json(self.reports / "trivy.json", {"SchemaVersion": 2, "ArtifactName": ".", "ArtifactType": "filesystem", "Results": []})
             return 0, ""
         with patch.object(runner, "executable", return_value="trivy"), patch.object(scan, "install", return_value=sys.executable), patch.object(scan, "run_command", side_effect=fake_command):
             return runner.raw_scan("trivy")
@@ -553,7 +592,7 @@ class ReportTests(unittest.TestCase):
         fixtures = [
             ("gitleaks", [{"RuleID": "test", "Secret": "REDACTED"}], 10),
             ("semgrep", {"results": [{"check_id": "test"}], "errors": []}, 0),
-            ("trivy", {"SchemaVersion": 2, "Results": []}, 0),
+            ("trivy", {"SchemaVersion": 2, "ArtifactName": ".", "ArtifactType": "filesystem", "Results": []}, 0),
             ("composer_audit", {"advisories": {"pkg": [{"title": "test"}]}}, 1),
             ("npm_audit", {"vulnerabilities": {"pkg": {}}, "metadata": {"vulnerabilities": {"total": 1}}}, 1),
             ("phpstan", {"files": {"test.php": {"messages": [{"message": "test"}]}}, "totals": {"file_errors": 1}, "errors": []}, 1),
@@ -583,6 +622,50 @@ class ReportTests(unittest.TestCase):
     def test_trivy_gate_only_counts_high_and_critical(self):
         payload = {"Results": [{"Vulnerabilities": [{"Severity": "LOW"}, {"Severity": "HIGH"}], "Misconfigurations": [{"Severity": "CRITICAL"}]}]}
         self.assertEqual((3, 2), scan.counts("trivy", payload))
+
+    def test_semgrep_requires_an_empty_errors_list(self):
+        self.assertFalse(scan.valid_report("semgrep", {"results": []}, 0))
+        for errors in (None, {}, "", False, 0, [{"message": "bad config"}]):
+            with self.subTest(errors=errors):
+                self.assertFalse(scan.valid_report("semgrep", {"results": [], "errors": errors}, 0))
+        self.assertTrue(scan.valid_report("semgrep", {"results": [], "errors": []}, 0))
+
+    def test_npm_requires_valid_metadata_and_nonnegative_integer_total(self):
+        for metadata in (None, [], "invalid", {}, {"vulnerabilities": []}, {"vulnerabilities": {}}):
+            with self.subTest(metadata=metadata):
+                self.assertFalse(scan.valid_report("npm_audit", {"vulnerabilities": {}, "metadata": metadata}, 0))
+        for total in (None, True, False, -1, 1.5, "0", [], {}):
+            with self.subTest(total=total):
+                payload = {"vulnerabilities": {}, "metadata": {"vulnerabilities": {"total": total}}}
+                self.assertFalse(scan.valid_report("npm_audit", payload, 0))
+        for total in (0, 3):
+            payload = {"vulnerabilities": {}, "metadata": {"vulnerabilities": {"total": total}}}
+            self.assertTrue(scan.valid_report("npm_audit", payload, 0))
+            self.assertEqual((total, total), scan.counts("npm_audit", payload))
+
+    def test_trivy_empty_reports_may_omit_results_but_require_scan_identity(self):
+        payload = {"SchemaVersion": 2, "ArtifactName": ".", "ArtifactType": "filesystem"}
+        self.assertTrue(scan.valid_report("trivy", payload, 0))
+        self.assertEqual((0, 0), scan.counts("trivy", payload))
+        self.assertTrue(scan.valid_report("trivy", {**payload, "Results": []}, 0))
+        for key in payload:
+            with self.subTest(missing=key):
+                self.assertFalse(scan.valid_report("trivy", {k: v for k, v in payload.items() if k != key}, 0))
+        self.assertFalse(scan.valid_report("trivy", {"SchemaVersion": 2}, 0))
+        self.assertFalse(scan.valid_report("trivy", payload, 1))
+
+    def test_trivy_rejects_malformed_results_before_counting(self):
+        payload = {"SchemaVersion": 2, "ArtifactName": ".", "ArtifactType": "filesystem"}
+        for results in (None, {}, "", [None], ["invalid"], [{}], [{"Target": 0}]):
+            with self.subTest(results=results):
+                self.assertFalse(scan.valid_report("trivy", {**payload, "Results": results}, 0))
+        for key in ("Vulnerabilities", "Misconfigurations", "Secrets", "Licenses"):
+            for findings in (None, {}, "invalid", [None], ["invalid"]):
+                with self.subTest(key=key, findings=findings):
+                    self.assertFalse(scan.valid_report("trivy", {**payload, "Results": [{"Target": "package-lock.json", key: findings}]}, 0))
+        valid = {**payload, "Results": [{"Target": "package-lock.json", "Vulnerabilities": [{"Severity": "HIGH"}]}]}
+        self.assertTrue(scan.valid_report("trivy", valid, 0))
+        self.assertEqual((1, 1), scan.counts("trivy", valid))
 
     def test_default_gate_reports_findings_without_blocking(self):
         summary = {"tools": {"semgrep": {"status": "completed", "findings_in_fail_severities": 2}}}
@@ -708,6 +791,31 @@ class UploadTests(unittest.TestCase):
 
 
 class InstallTests(unittest.TestCase):
+    def test_python_installation_enforces_hashes_wheels_and_fixed_index(self):
+        for name in ("semgrep", "pyyaml"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory, patch.object(install_tools.platform, "system", return_value="Linux"), patch.object(install_tools.platform, "machine", return_value="x86_64"), patch.object(install_tools.subprocess, "run") as run:
+                install_tools.install(name, Path(directory), {"PIP_CONFIG_FILE": "/untrusted/pip.conf", "PIP_INDEX_URL": "https://untrusted.example"})
+                for call in run.call_args_list:
+                    self.assertEqual(["-I", "-m"], call.args[0][1:3])
+                command = run.call_args.args[0]
+                self.assertIn("--isolated", command)
+                self.assertIn("--require-hashes", command)
+                self.assertIn("--only-binary=:all:", command)
+                self.assertEqual("https://pypi.org/simple", command[command.index("--index-url") + 1])
+                self.assertEqual(str(install_tools.REQUIREMENTS / f"{name}.txt"), command[command.index("--requirement") + 1])
+                self.assertEqual(os.devnull, run.call_args.kwargs["env"]["PIP_CONFIG_FILE"])
+
+    def test_python_locks_match_tool_versions_and_hash_every_requirement(self):
+        for name, package, version in (("semgrep", "semgrep", install_tools.VERSIONS["semgrep"]), ("pyyaml", "pyyaml", install_tools.PYYAML_VERSION)):
+            with self.subTest(name=name):
+                text = (install_tools.REQUIREMENTS / f"{name}.txt").read_text()
+                self.assertIn(f"{package}=={version} \\", text)
+                requirements = [entry for entry in text.replace("\\\n", "").splitlines() if entry and not entry.startswith(("#", " "))]
+                self.assertTrue(requirements)
+                for requirement in requirements:
+                    self.assertRegex(requirement, r"^[A-Za-z0-9_.-]+==[^\s;]+")
+                    self.assertIn("--hash=sha256:", requirement)
+
     def test_binary_checksum_is_verified_before_extraction(self):
         response = Mock()
         response.__enter__ = Mock(return_value=response)
