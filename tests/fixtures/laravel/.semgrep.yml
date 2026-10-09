@@ -1,0 +1,6 @@
+rules:
+  - id: fixture-php-eval
+    message: Do not evaluate arbitrary code.
+    languages: [php]
+    severity: ERROR
+    pattern: eval(...)

@@ -1,0 +1,126 @@
+name: Amyla Security Scan
+description: Scan your repository and optionally upload reports to Amyla, without manual target setup.
+author: Amyla
+branding:
+  icon: shield
+  color: blue
+inputs:
+  token:
+    description: Team upload token. Empty means scan without uploading (also suitable for fork pull requests).
+    required: false
+    default: ''
+  ingest-url:
+    description: HTTPS Amyla GitHub Actions ingest endpoint.
+    default: https://services.amyla.net/api/scanner/ingests/github-actions
+  scan-target-id:
+    description: Optional legacy target identifier. Normally targets are resolved automatically.
+    default: ''
+  working-directory:
+    description: Directory to scan, relative to the checked-out repository.
+    default: '.'
+  profile:
+    description: 'Scanner defaults: auto, laravel, kirby, php, or general.'
+    default: auto
+  fail-on-findings:
+    description: Fail after all scans and uploads when findings exist (Trivy HIGH/CRITICAL only).
+    default: 'false'
+  run-gitleaks:
+    description: 'Run Gitleaks: auto, true, false.'
+    default: auto
+  run-semgrep:
+    description: 'Run Semgrep: auto, true, false.'
+    default: auto
+  run-trivy:
+    description: 'Run Trivy: auto, true, false.'
+    default: auto
+  run-composer-audit:
+    description: 'Run Composer audit: auto detects root composer.lock, or true/false.'
+    default: auto
+  run-npm-audit:
+    description: 'Run npm audit: auto detects root package-lock.json/npm-shrinkwrap.json, or true/false.'
+    default: auto
+  run-phpstan:
+    description: 'Run the project-installed vendor/bin/phpstan: auto/false disables, true enables.'
+    default: 'false'
+  gitleaks-config:
+    description: Local configuration path. Auto uses .github/.gitleaks.toml, then .gitleaks.toml, then built-in rules.
+    default: ''
+  gitleaks-mode:
+    description: 'directory scans the current checkout; git scans available Git history (use fetch-depth: 0).'
+    default: directory
+  semgrep-config:
+    description: Comma/newline-separated local config paths or p/... registry rules. Replaces defaults; auto detects .semgrep.yml/.semgrep.yaml.
+    default: ''
+  semgrep-extra-configs:
+    description: Comma/newline-separated configs added to selected/default Semgrep rules.
+    default: ''
+  semgrep-extra-excludes:
+    description: Comma/newline-separated exclude patterns added to profile defaults.
+    default: ''
+  composer-audit-paths:
+    description: Comma/newline-separated directories relative to working-directory; empty means root only.
+    default: ''
+  npm-audit-paths:
+    description: Comma/newline-separated directories relative to working-directory; empty means root only.
+    default: ''
+  phpstan-config:
+    description: Optional local PHPStan configuration path; otherwise PHPStan discovers the project configuration.
+    default: ''
+  trivy-extra-skip-dirs:
+    description: Comma/newline-separated directory patterns added to profile defaults.
+    default: ''
+outputs:
+  scan-batch-id:
+    description: Amyla scan batch identifier, empty when no upload completed.
+    value: ${{ steps.upload.outputs.scan-batch-id }}
+  reports-path:
+    description: Absolute temporary directory containing summary.json and available raw reports.
+    value: ${{ steps.scan.outputs.reports-path }}
+  upload-status:
+    description: 'Upload outcome: completed, failed, or skipped.'
+    value: ${{ steps.upload.outputs.upload-status }}
+runs:
+  using: composite
+  steps:
+    - name: Run independent scanners
+      id: scan
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        SCAN_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        SCAN_PROFILE: ${{ inputs.profile }}
+        SCAN_RUN_GITLEAKS: ${{ inputs.run-gitleaks }}
+        SCAN_RUN_SEMGREP: ${{ inputs.run-semgrep }}
+        SCAN_RUN_TRIVY: ${{ inputs.run-trivy }}
+        SCAN_RUN_COMPOSER_AUDIT: ${{ inputs.run-composer-audit }}
+        SCAN_RUN_NPM_AUDIT: ${{ inputs.run-npm-audit }}
+        SCAN_RUN_PHPSTAN: ${{ inputs.run-phpstan }}
+        SCAN_GITLEAKS_CONFIG: ${{ inputs.gitleaks-config }}
+        SCAN_GITLEAKS_MODE: ${{ inputs.gitleaks-mode }}
+        SCAN_SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+        SCAN_SEMGREP_EXTRA_CONFIGS: ${{ inputs.semgrep-extra-configs }}
+        SCAN_SEMGREP_EXTRA_EXCLUDES: ${{ inputs.semgrep-extra-excludes }}
+        SCAN_COMPOSER_AUDIT_PATHS: ${{ inputs.composer-audit-paths }}
+        SCAN_NPM_AUDIT_PATHS: ${{ inputs.npm-audit-paths }}
+        SCAN_PHPSTAN_CONFIG: ${{ inputs.phpstan-config }}
+        SCAN_TRIVY_EXTRA_SKIP_DIRS: ${{ inputs.trivy-extra-skip-dirs }}
+      run: python3 "$ACTION_PATH/scripts/security_scan.py" scan
+    - name: Upload available reports
+      id: upload
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        SCAN_REPORTS_PATH: ${{ steps.scan.outputs.reports-path }}
+        SCAN_TOKEN: ${{ inputs.token }}
+        SCAN_INGEST_URL: ${{ inputs.ingest-url }}
+        SCAN_TARGET_ID: ${{ inputs.scan-target-id }}
+      run: python3 "$ACTION_PATH/scripts/security_scan.py" upload
+    - name: Check final result
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        SCAN_REPORTS_PATH: ${{ steps.scan.outputs.reports-path }}
+        SCAN_FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+      run: python3 "$ACTION_PATH/scripts/security_scan.py" gate
