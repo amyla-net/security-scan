@@ -483,6 +483,17 @@ class ScannerTests(unittest.TestCase):
         with patch.object(subprocess, "run", return_value=Mock(returncode=0, stdout="false\n")):
             scan.assert_full_git_history(self.root, runner.environment)
 
+    def test_gitleaks_malformed_report_is_failed_before_counting(self):
+        runner = scan.Scanner(self.root, self.reports, "general")
+        for payload in ([None], ["error"], [{}]):
+            def fake_command(command, root, environment, report):
+                scan.save_json(self.reports / "gitleaks.json", payload)
+                return 10, ""
+            with self.subTest(payload=payload), patch.object(runner, "executable", return_value="gitleaks"), patch.object(scan, "run_command", side_effect=fake_command):
+                state = runner.raw_scan("gitleaks")
+                self.assertEqual("failed", state["status"])
+                self.assertNotIn("findings", state)
+
     def test_gitleaks_extended_config_content_changes_scope(self):
         config = self.write(".gitleaks.toml", '[extend]\npath = "configs/base.toml"\n')
         base = self.write("configs/base.toml", "title='base'")
@@ -590,7 +601,7 @@ class ScannerTests(unittest.TestCase):
 class ReportTests(unittest.TestCase):
     def test_findings_exit_codes_are_completed_not_runtime_errors(self):
         fixtures = [
-            ("gitleaks", [{"RuleID": "test", "Secret": "REDACTED"}], 10),
+            ("gitleaks", [{"RuleID": "test", "File": "config.php", "StartLine": 1, "EndLine": 1, "Secret": "REDACTED"}], 10),
             ("semgrep", {"results": [{"check_id": "test"}], "errors": []}, 0),
             ("trivy", {"SchemaVersion": 2, "ArtifactName": ".", "ArtifactType": "filesystem", "Results": []}, 0),
             ("composer_audit", {"advisories": {"pkg": [{"title": "test"}]}}, 1),
@@ -622,6 +633,38 @@ class ReportTests(unittest.TestCase):
     def test_trivy_gate_only_counts_high_and_critical(self):
         payload = {"Results": [{"Vulnerabilities": [{"Severity": "LOW"}, {"Severity": "HIGH"}], "Misconfigurations": [{"Severity": "CRITICAL"}]}]}
         self.assertEqual((3, 2), scan.counts("trivy", payload))
+
+    def test_gitleaks_requires_finding_objects_and_identity_fields(self):
+        valid = {"RuleID": "test", "File": "config.php", "StartLine": 1, "EndLine": 1}
+        for finding in (None, "error", [], 1, True, {}):
+            for payload in ([finding], [valid, finding]):
+                with self.subTest(payload=payload):
+                    self.assertFalse(scan.valid_report("gitleaks", payload, 10))
+        for key in valid:
+            with self.subTest(missing=key):
+                self.assertFalse(scan.valid_report("gitleaks", [{k: v for k, v in valid.items() if k != key}], 10))
+        for key in ("RuleID", "File"):
+            for value in (None, "", [], {}, 1, True):
+                with self.subTest(key=key, value=value):
+                    self.assertFalse(scan.valid_report("gitleaks", [{**valid, key: value}], 10))
+
+    def test_gitleaks_requires_valid_line_ranges(self):
+        valid = {"RuleID": "test", "File": "config.php", "StartLine": 1, "EndLine": 1}
+        for key in ("StartLine", "EndLine"):
+            for value in (None, "1", 1.5, True, False, -1, [], {}):
+                with self.subTest(key=key, value=value):
+                    self.assertFalse(scan.valid_report("gitleaks", [{**valid, key: value}], 10))
+        self.assertFalse(scan.valid_report("gitleaks", [{**valid, "StartLine": 2}], 10))
+
+    def test_gitleaks_accepts_empty_redacted_and_path_only_reports(self):
+        self.assertTrue(scan.valid_report("gitleaks", [], 0))
+        self.assertEqual((0, 0), scan.counts("gitleaks", []))
+        for start, end in ((1, 1), (2, 4), (0, 0)):
+            finding = {"RuleID": "test", "File": "config.php", "StartLine": start, "EndLine": end, "Secret": "REDACTED"}
+            with self.subTest(start=start, end=end):
+                self.assertTrue(scan.valid_report("gitleaks", [finding], 10))
+                self.assertEqual((1, 1), scan.counts("gitleaks", [finding]))
+                self.assertFalse(scan.valid_report("gitleaks", [finding], 1))
 
     def test_semgrep_requires_an_empty_errors_list(self):
         self.assertFalse(scan.valid_report("semgrep", {"results": []}, 0))

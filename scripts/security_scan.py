@@ -408,7 +408,18 @@ def run_command(command: list[str], root: Path, environment: dict[str, str], rep
 
 def valid_report(scanner: str, payload: object, code: int, stderr: str = "") -> bool:
     if scanner == "gitleaks":
-        return isinstance(payload, list) and code in {0, 10}
+        if not isinstance(payload, list) or code not in {0, 10}:
+            return False
+        for finding in payload:
+            if not isinstance(finding, dict):
+                return False
+            if any(not isinstance(finding.get(key), str) or not finding[key] for key in ("RuleID", "File")):
+                return False
+            start, end = finding.get("StartLine"), finding.get("EndLine")
+            # Rules that match only a file path legitimately emit zero lines.
+            if type(start) is not int or type(end) is not int or start < 0 or end < start:
+                return False
+        return True
     if not isinstance(payload, dict):
         return False
     if scanner == "semgrep":
