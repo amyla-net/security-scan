@@ -687,28 +687,76 @@ class ReportTests(unittest.TestCase):
             self.assertEqual((total, total), scan.counts("npm_audit", payload))
 
     def test_trivy_empty_reports_may_omit_results_but_require_scan_identity(self):
-        payload = {"SchemaVersion": 2, "ArtifactName": ".", "ArtifactType": "filesystem"}
-        self.assertTrue(scan.valid_report("trivy", payload, 0))
-        self.assertEqual((0, 0), scan.counts("trivy", payload))
-        self.assertTrue(scan.valid_report("trivy", {**payload, "Results": []}, 0))
-        for key in payload:
-            with self.subTest(missing=key):
-                self.assertFalse(scan.valid_report("trivy", {k: v for k, v in payload.items() if k != key}, 0))
+        for artifact_type in ("filesystem", "repository"):
+            payload = {"SchemaVersion": 2, "ArtifactName": ".", "ArtifactType": artifact_type}
+            with self.subTest(artifact_type=artifact_type):
+                for report in (payload, {**payload, "Results": []}):
+                    self.assertTrue(scan.valid_report("trivy", report, 0))
+                    self.assertEqual((0, 0), scan.counts("trivy", report))
+                for key in payload:
+                    with self.subTest(missing=key):
+                        self.assertFalse(scan.valid_report("trivy", {k: v for k, v in payload.items() if k != key}, 0))
         self.assertFalse(scan.valid_report("trivy", {"SchemaVersion": 2}, 0))
-        self.assertFalse(scan.valid_report("trivy", payload, 1))
+
+    def test_trivy_populated_reports_preserve_findings_counts_and_gate_policy(self):
+        results = [
+            {"Target": "composer.lock"},
+            {"Target": "package-lock.json"},
+            {"Target": "docker/php/sail-8.4/Dockerfile"},
+        ]
+        for artifact_type in ("filesystem", "repository"):
+            payload = {"SchemaVersion": 2, "ArtifactName": ".", "ArtifactType": artifact_type}
+            for findings in ({}, {
+                "Vulnerabilities": [{"Severity": "LOW"}, {"Severity": "HIGH"}],
+                "Misconfigurations": [{"Severity": "CRITICAL"}],
+                "Secrets": [{"Severity": "MEDIUM"}],
+                "Licenses": [{"Severity": "HIGH"}],
+            }):
+                with self.subTest(artifact_type=artifact_type, findings=bool(findings)):
+                    report = {**payload, "Results": [*results, {"Target": "app.lock", **findings}]}
+                    self.assertTrue(scan.valid_report("trivy", report, 0))
+                    total, gated = scan.counts("trivy", report)
+                    self.assertEqual((5, 3) if findings else (0, 0), (total, gated))
+                    summary = {"tools": {"trivy": {
+                        "status": "completed", "findings_in_fail_severities": gated,
+                    }}}
+                    self.assertEqual(not findings, scan.gate_result(summary, {"status": "completed"}, True))
+                    self.assertTrue(scan.gate_result(summary, {"status": "completed"}, False))
+
+    def test_trivy_rejects_invalid_identity_and_execution_errors(self):
+        for artifact_type in ("filesystem", "repository"):
+            payload = {"SchemaVersion": 2, "ArtifactName": ".", "ArtifactType": artifact_type, "Results": []}
+            for key, values in (
+                ("SchemaVersion", (None, True, False, 1, 3, 2.0, "2", [], {})),
+                ("ArtifactName", (None, "", True, 1, [], {})),
+                ("error", ("database download failed", {"message": "scan incomplete"})),
+            ):
+                for value in values:
+                    with self.subTest(artifact_type=artifact_type, key=key, value=value):
+                        self.assertFalse(scan.valid_report("trivy", {**payload, key: value}, 0))
+            for code in (1, 2, -1, 127):
+                with self.subTest(artifact_type=artifact_type, code=code):
+                    self.assertFalse(scan.valid_report("trivy", payload, code))
+
+    def test_trivy_rejects_unsupported_artifact_types(self):
+        payload = {"SchemaVersion": 2, "ArtifactName": ".", "Results": []}
+        for artifact_type in (None, "", "container_image", "vm", "unknown", True, 1, [], {}):
+            with self.subTest(artifact_type=artifact_type):
+                self.assertFalse(scan.valid_report("trivy", {**payload, "ArtifactType": artifact_type}, 0))
 
     def test_trivy_rejects_malformed_results_before_counting(self):
-        payload = {"SchemaVersion": 2, "ArtifactName": ".", "ArtifactType": "filesystem"}
-        for results in (None, {}, "", [None], ["invalid"], [{}], [{"Target": 0}]):
-            with self.subTest(results=results):
-                self.assertFalse(scan.valid_report("trivy", {**payload, "Results": results}, 0))
-        for key in ("Vulnerabilities", "Misconfigurations", "Secrets", "Licenses"):
-            for findings in (None, {}, "invalid", [None], ["invalid"]):
-                with self.subTest(key=key, findings=findings):
-                    self.assertFalse(scan.valid_report("trivy", {**payload, "Results": [{"Target": "package-lock.json", key: findings}]}, 0))
-        valid = {**payload, "Results": [{"Target": "package-lock.json", "Vulnerabilities": [{"Severity": "HIGH"}]}]}
-        self.assertTrue(scan.valid_report("trivy", valid, 0))
-        self.assertEqual((1, 1), scan.counts("trivy", valid))
+        for artifact_type in ("filesystem", "repository"):
+            payload = {"SchemaVersion": 2, "ArtifactName": ".", "ArtifactType": artifact_type}
+            for results in (None, {}, "", [None], ["invalid"], [{}], [{"Target": 0}], [{"Target": ""}]):
+                with self.subTest(artifact_type=artifact_type, results=results):
+                    self.assertFalse(scan.valid_report("trivy", {**payload, "Results": results}, 0))
+            for key in ("Vulnerabilities", "Misconfigurations", "Secrets", "Licenses"):
+                for findings in (None, {}, "invalid", [None], ["invalid"]):
+                    with self.subTest(artifact_type=artifact_type, key=key, findings=findings):
+                        self.assertFalse(scan.valid_report("trivy", {**payload, "Results": [{"Target": "package-lock.json", key: findings}]}, 0))
+            valid = {**payload, "Results": [{"Target": "package-lock.json", "Vulnerabilities": [{"Severity": "HIGH"}]}]}
+            self.assertTrue(scan.valid_report("trivy", valid, 0))
+            self.assertEqual((1, 1), scan.counts("trivy", valid))
 
     def test_default_gate_reports_findings_without_blocking(self):
         summary = {"tools": {"semgrep": {"status": "completed", "findings_in_fail_severities": 2}}}
