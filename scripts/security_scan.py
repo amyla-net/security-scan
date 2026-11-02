@@ -426,11 +426,11 @@ def valid_report(scanner: str, payload: object, code: int, stderr: str = "") -> 
         return (code == 0 and isinstance(payload.get("results"), list)
                 and isinstance(payload.get("errors"), list) and not payload["errors"])
     if scanner == "trivy":
-        # Empty filesystem scans legitimately omit Results. Require the scan
+        # Empty scans legitimately omit Results. Require the scan
         # identity instead of accepting a bare SchemaVersion as a full report.
         results = payload.get("Results", [])
         if (code != 0 or type(payload.get("SchemaVersion")) is not int or payload["SchemaVersion"] != 2
-                or payload.get("ArtifactType") != "filesystem"
+                or payload.get("ArtifactType") not in ("filesystem", "repository")
                 or not isinstance(payload.get("ArtifactName"), str) or not payload["ArtifactName"]
                 or not isinstance(results, list) or payload.get("error")):
             return False
