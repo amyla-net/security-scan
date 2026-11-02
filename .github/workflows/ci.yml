@@ -57,3 +57,72 @@ jobs:
               assert len(summary['tools'][name]['scope_hash']) == 64, name
               assert (reports / f'{name}.json').is_file(), name
           PY
+  zap-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [baseline, full]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Start controlled loopback application
+        run: |
+          python3 tests/zap_smoke_server.py >"$RUNNER_TEMP/zap-app.log" 2>&1 &
+          for attempt in {1..30}; do
+            if curl --fail --silent --header 'Authorization: Bearer fixture-zap-auth' http://127.0.0.1:8818/ >/dev/null; then
+              exit 0
+            fi
+            if [ "$attempt" = 30 ]; then exit 1; fi
+            sleep 1
+          done
+          exit 1
+      - name: Scan the fixture with ZAP only
+        id: zap
+        uses: ./ # zizmor: ignore[self-repository] Actionlint 1.7.12 cannot parse GitHub's newer $/ syntax yet.
+        with:
+          token: ''
+          run-gitleaks: 'false'
+          run-semgrep: 'false'
+          run-trivy: 'false'
+          run-composer-audit: 'false'
+          run-npm-audit: 'false'
+          run-phpstan: 'false'
+          run-zap: 'true'
+          zap-scan-mode: ${{ matrix.mode }}
+          zap-target-url: http://127.0.0.1:8818/
+          zap-headers: '{"Authorization":"Bearer fixture-zap-auth","X-Access-Key":"fixture-zap-key"}'
+          zap-timeout: '1200'
+          zap-fail-on: none
+      - name: Verify completed, sanitized ZAP report
+        env:
+          REPORTS_PATH: ${{ steps.zap.outputs.reports-path }}
+          UPLOAD_STATUS: ${{ steps.zap.outputs.upload-status }}
+          ZAP_MODE: ${{ matrix.mode }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          from pathlib import Path
+          reports = Path(os.environ['REPORTS_PATH'])
+          summary = json.loads((reports / 'summary.json').read_text())
+          state = summary['tools']['zap']
+          assert state['status'] == 'completed', state
+          assert state['scan_mode'] == os.environ['ZAP_MODE']
+          assert len(state['scope_hash']) == 64
+          assert state['findings'] > 0
+          assert os.environ['UPLOAD_STATUS'] == 'skipped'
+          assert 'fixture-zap-auth' not in (reports / 'zap.json').read_text()
+          assert 'fixture-zap-key' not in (reports / 'zap.json').read_text()
+          if os.environ['ZAP_MODE'] == 'full':
+              payload = json.loads((reports / 'zap.json').read_text())
+              assert any(str(alert['pluginid']) in {'40012', '40026'} and str(alert['riskcode']) == '3'
+                         for site in payload['site'] for alert in site['alerts'])
+          assert not list(reports.parent.glob('zap-work'))
+          request = urllib.request.Request('http://127.0.0.1:8818/probe', headers={'Authorization': 'Bearer fixture-zap-auth'})
+          with urllib.request.urlopen(request, timeout=10) as response:
+              probe = json.load(response)
+          assert probe['visited'] > 0, probe
+          assert not probe['credential_leaked'], probe
+          PY
