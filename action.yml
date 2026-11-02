@@ -15,6 +15,9 @@ inputs:
   scan-target-id:
     description: Optional legacy target identifier. Normally targets are resolved automatically.
     default: ''
+  scan-instance:
+    description: Stable identifier for this action invocation; distinguish multiple uploads in one GitHub run.
+    default: ''
   working-directory:
     description: Directory to scan, relative to the checked-out repository.
     default: '.'
@@ -42,6 +45,36 @@ inputs:
   run-phpstan:
     description: 'Run the project-installed vendor/bin/phpstan: auto/false disables, true enables.'
     default: 'false'
+  run-zap:
+    description: 'Run ZAP against a deployed application: true/false; auto disables.'
+    default: 'false'
+  zap-scan-mode:
+    description: 'baseline crawls briefly and scans passively; full crawls and actively attacks an authorized test target.'
+    default: baseline
+  zap-target-url:
+    description: HTTP(S) application URL; no embedded credentials, query, or fragment. Requires Docker on the runner.
+    default: ''
+  zap-timeout:
+    description: 'Internal scan deadline in seconds, 60-5400. Empty uses 600 for baseline or 3600 for full; leave extra job time for upload.'
+    default: ''
+  zap-auth-username:
+    description: HTTP Basic username, supplied via a GitHub secret together with zap-auth-password.
+    default: ''
+  zap-auth-password:
+    description: HTTP Basic password, supplied via a GitHub secret.
+    default: ''
+  zap-headers:
+    description: JSON object of fixed request headers, supplied via a GitHub secret; e.g. Authorization with a Bearer token.
+    default: ''
+  zap-auth-profile:
+    description: Non-secret scan identity for the authenticated role; change when its permissions or coverage change.
+    default: default
+  zap-exclude-urls:
+    description: Newline-separated URL regexes excluded from crawling and scanning.
+    default: ''
+  zap-fail-on:
+    description: 'inherit follows fail-on-findings (High); none only reports; high/medium fail at that risk threshold.'
+    default: inherit
   gitleaks-config:
     description: Local configuration path. Auto uses .github/.gitleaks.toml, then .gitleaks.toml, then built-in rules.
     default: ''
@@ -95,6 +128,17 @@ runs:
         SCAN_RUN_COMPOSER_AUDIT: ${{ inputs.run-composer-audit }}
         SCAN_RUN_NPM_AUDIT: ${{ inputs.run-npm-audit }}
         SCAN_RUN_PHPSTAN: ${{ inputs.run-phpstan }}
+        SCAN_SCAN_INSTANCE: ${{ inputs.scan-instance }}
+        SCAN_RUN_ZAP: ${{ inputs.run-zap }}
+        SCAN_ZAP_SCAN_MODE: ${{ inputs.zap-scan-mode }}
+        SCAN_ZAP_TARGET_URL: ${{ inputs.zap-target-url }}
+        SCAN_ZAP_TIMEOUT: ${{ inputs.zap-timeout }}
+        SCAN_ZAP_AUTH_USERNAME: ${{ inputs.zap-auth-username }}
+        SCAN_ZAP_AUTH_PASSWORD: ${{ inputs.zap-auth-password }}
+        SCAN_ZAP_HEADERS: ${{ inputs.zap-headers }}
+        SCAN_ZAP_AUTH_PROFILE: ${{ inputs.zap-auth-profile }}
+        SCAN_ZAP_EXCLUDE_URLS: ${{ inputs.zap-exclude-urls }}
+        SCAN_ZAP_FAIL_ON: ${{ inputs.zap-fail-on }}
         SCAN_GITLEAKS_CONFIG: ${{ inputs.gitleaks-config }}
         SCAN_GITLEAKS_MODE: ${{ inputs.gitleaks-mode }}
         SCAN_SEMGREP_CONFIG: ${{ inputs.semgrep-config }}

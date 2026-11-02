@@ -23,9 +23,10 @@ except ModuleNotFoundError:
     import tomli as tomllib
 
 from install_tools import VERSIONS, install
+import zap_scan
 
 
-SCANNERS = ("gitleaks", "semgrep", "trivy", "composer_audit", "npm_audit", "phpstan")
+SCANNERS = ("gitleaks", "semgrep", "trivy", "composer_audit", "npm_audit", "phpstan", "zap")
 PROFILE_EXCLUDES = {
     "general": ["vendor", "node_modules", ".git"],
     "php": ["vendor", "node_modules", ".git", "var/cache", "cache"],
@@ -359,6 +360,11 @@ def metadata(root: Path) -> dict:
         "actor": os.environ.get("GITHUB_ACTOR", ""),
         "run_url": f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{os.environ.get('GITHUB_RUN_ID', '')}",
     }
+    instance = input_value("scan-instance")
+    if instance:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", instance):
+            raise ValueError("scan-instance must be a short stable identifier.")
+        result["scan_instance"] = instance
     if event.get("pull_request"):
         result["pull_request_number"] = str(event["pull_request"]["number"])
     return result
@@ -503,6 +509,10 @@ class Scanner:
         return executable
 
     def raw_scan(self, name: str) -> dict:
+        if name == "zap":
+            config = zap_scan.configuration(input_value, lambda name: os.environ.get("SCAN_" + name.upper().replace("-", "_"), ""))
+            scanner_scope = scope_hash(self.root, name, config["settings"], [])
+            return {**zap_scan.run(config, self.reports, self.environment), "scope_hash": scanner_scope}
         report = self.reports / f"{name}.json"
         configs = []
         settings = {}
@@ -641,7 +651,7 @@ def scan() -> int:
     reports = temporary / "reports"
     reports.mkdir(mode=0o700)
     output("reports-path", str(reports))
-    summary = {"enabled_scanners": {}, "tools": {}, "action_version": "1", "scanner_versions": VERSIONS}
+    summary = {"enabled_scanners": {}, "tools": {}, "action_version": "1", "scanner_versions": {**VERSIONS, "zap": zap_scan.IMAGE}}
     try:
         workspace = Path(os.environ.get("GITHUB_WORKSPACE", os.getcwd())).resolve()
         root = safe_path(workspace, input_value("working-directory", "."), directory=True)
@@ -685,7 +695,7 @@ def validate_endpoint(endpoint: str) -> None:
 def multipart(summary: dict, reports: Path, target_id: str) -> tuple[bytes, str]:
     boundary = "amyla-" + uuid.uuid4().hex
     parts = []
-    fields = {key: summary.get(key) for key in ("repository", "repository_id", "default_ref", "ref", "commit_sha", "event_name", "run_id", "run_attempt", "run_number", "actor", "run_url", "pull_request_number")}
+    fields = {key: summary.get(key) for key in ("repository", "repository_id", "default_ref", "ref", "commit_sha", "event_name", "run_id", "run_attempt", "run_number", "actor", "run_url", "pull_request_number", "scan_instance")}
     if target_id:
         fields["scan_target_id"] = target_id
     for key, value in fields.items():
@@ -782,8 +792,12 @@ def gate_result(summary: dict, upload_state: dict, fail_on_findings: bool) -> bo
     states = summary.get("tools", {})
     if any(state.get("status") == "failed" for state in states.values()):
         return False
-    if fail_on_findings and any(state.get("findings_in_fail_severities", 0) > 0 for state in states.values()):
-        return False
+    for name, state in states.items():
+        should_gate = fail_on_findings
+        if name == "zap" and state.get("fail_on", "inherit") != "inherit":
+            should_gate = state["fail_on"] in {"high", "medium"}
+        if should_gate and state.get("findings_in_fail_severities", 0) > 0:
+            return False
     return True
 
 
